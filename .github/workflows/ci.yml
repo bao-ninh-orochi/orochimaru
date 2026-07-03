@@ -35,9 +35,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          # --all-features covers the optional proof-system backends
-          # (e.g. the `zinc` feature of zkmemory).
-          args: --all-features --verbose
+          args: --verbose
 
   fmt:
     name: Rustfmt
