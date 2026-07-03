@@ -69,18 +69,12 @@ pub fn evm_verify(smart_contract_proof: &ECVRFContractProof) -> bool {
         .result
     {
         ExecutionResult::Success {
-            reason,
+            reason: SuccessReason::Return,
             gas_used: _,
             gas_refunded: _,
             logs: _,
             output,
-        } => {
-            if reason == SuccessReason::Return {
-                Scalar::from_bytes(output.data()) == smart_contract_proof.y
-            } else {
-                false
-            }
-        }
+        } => Scalar::from_bytes(output.data()) == smart_contract_proof.y,
         _ => false,
     }
 }

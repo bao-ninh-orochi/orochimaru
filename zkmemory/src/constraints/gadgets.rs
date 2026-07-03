@@ -123,13 +123,13 @@ impl<F: Field + PrimeField, const N: usize> BinaryConfig<F, N> {
     pub fn configure(meta: &mut ConstraintSystem<F>, selector: Column<Fixed>) -> Self {
         let bits = [0; N].map(|_| meta.advice_column());
         let one = Expression::Constant(F::ONE);
-        bits.map(|bit| {
+        for bit in bits {
             meta.create_gate("bit column is 0 or 1", |meta| {
                 let selector = meta.query_fixed(selector, Rotation::cur());
                 let bit = meta.query_advice(bit, Rotation::cur());
                 vec![selector * bit.clone() * (one.clone() - bit)]
-            })
-        });
+            });
+        }
         BinaryConfig {
             bits,
             _marker: PhantomData,

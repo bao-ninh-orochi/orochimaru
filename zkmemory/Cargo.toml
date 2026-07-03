@@ -16,6 +16,19 @@ categories = ["zkp", "cryptography", "vm", "ram"]
 name = "zkmemory"
 path = "src/lib.rs"
 
+[lints.rust]
+# Two cfgs are referenced by the sources without being features of this
+# crate: `feature = "std"` (the aspirational `no_std` switch in `lib.rs`;
+# turning it into a real feature would make every `extern crate alloc`
+# non-idiomatic) and `feature = "circuit-params"` (mirrors the
+# `halo2_proofs` feature of the same name inside one `Circuit`
+# implementation; enabling it for the crate would require every `Circuit`
+# implementation to define the extra associated items). Declare them as
+# known cfgs instead.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("std", "circuit-params"))',
+] }
+
 [dependencies]
 halo2_proofs = { workspace = true }
 halo2curves = { workspace = true }
