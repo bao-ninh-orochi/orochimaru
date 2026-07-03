@@ -323,7 +323,7 @@ impl MerkleTreeProver {
         >(
             &self.params,
             &self.pk,
-            &[self.circuit.clone()],
+            core::slice::from_ref(&self.circuit),
             &[&[&public_inputs[..]]],
             OsRng,
             &mut transcript,

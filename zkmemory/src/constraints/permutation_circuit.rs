@@ -237,7 +237,7 @@ where
         >(
             &self.params,
             &self.pk,
-            &[self.circuit.clone()],
+            core::slice::from_ref(&self.circuit),
             &[&[]],
             OsRng,
             &mut transcript,

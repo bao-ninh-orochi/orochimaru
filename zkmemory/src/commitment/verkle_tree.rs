@@ -2,6 +2,9 @@
 //! The label of a parent node is the commitment of the messages in all its children.
 //! We choose KZG as the polynomial commitment scheme for committing the messages in the children.
 //! Right now, the circuit could only support committing messages in the field Fr of Bn256, not in all finite fields.
+// The circuit and its configuration are currently exercised only by the test
+// module of this file, so non-test builds see them as dead code.
+#![cfg_attr(not(test), allow(dead_code))]
 extern crate alloc;
 use super::kzg::verify_kzg_proof;
 use crate::constraints;

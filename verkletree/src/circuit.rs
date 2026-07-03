@@ -371,7 +371,7 @@ impl<S: Spec<Fr, W, R>, const W: usize, const R: usize, const A: usize>
         >(
             &self.params,
             &self.pk,
-            &[self.circuit.clone()],
+            std::slice::from_ref(&self.circuit),
             &[&[&[leaf, root]]],
             OsRng,
             &mut transcript,

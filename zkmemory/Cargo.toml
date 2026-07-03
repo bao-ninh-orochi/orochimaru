@@ -16,6 +16,38 @@ categories = ["zkp", "cryptography", "vm", "ram"]
 name = "zkmemory"
 path = "src/lib.rs"
 
+[lints.rust]
+# Two cfgs are referenced by the sources without being features of this
+# crate: `feature = "std"` (the aspirational `no_std` switch in `lib.rs`;
+# turning it into a real feature would make every `extern crate alloc`
+# non-idiomatic) and `feature = "circuit-params"` (mirrors the
+# `halo2_proofs` feature of the same name inside one `Circuit`
+# implementation; enabling it for the crate would require every `Circuit`
+# implementation to define the extra associated items). Declare them as
+# known cfgs instead.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("std", "circuit-params"))',
+] }
+
+[features]
+# Optional Zinc+ proof-system backend (see `src/zincplus/README.md`).
+# Zinc+ is a transparent SNARK *without zero-knowledge*; the feature is off by
+# default and requires a `std` environment.
+zinc = [
+    "dep:zinc-protocol",
+    "dep:zinc-uair",
+    "dep:zinc-poly",
+    "dep:zinc-primality",
+    "dep:zinc-utils",
+    "dep:zip-plus",
+    "dep:crypto-bigint",
+    "dep:crypto-primitives",
+]
+
+[[example]]
+name = "zincplus-memory-consistency"
+required-features = ["zinc"]
+
 [dependencies]
 halo2_proofs = { workspace = true }
 halo2curves = { workspace = true }
@@ -32,3 +64,11 @@ nova-snark = { workspace = true }
 bellpepper-core = { workspace = true }
 poseidon = { path = "../poseidon" }
 arecibo = { workspace = true }
+zinc-protocol = { workspace = true, optional = true }
+zinc-uair = { workspace = true, optional = true }
+zinc-poly = { workspace = true, optional = true }
+zinc-primality = { workspace = true, optional = true }
+zinc-utils = { workspace = true, optional = true }
+zip-plus = { workspace = true, optional = true }
+crypto-bigint = { workspace = true, optional = true }
+crypto-primitives = { workspace = true, optional = true }

@@ -47,7 +47,7 @@ pub trait Domain<F: Field + PrimeField, const R: usize>: Clone {
 pub struct ConstantLength<const L: usize>;
 
 impl<F: Field + PrimeField, const R: usize, const L: usize> Domain<F, R> for ConstantLength<L> {
-    type Padding = iter::Take<iter::Repeat<F>>;
+    type Padding = iter::RepeatN<F>;
 
     fn initial_capacity_element() -> F {
         F::from_u128((L as u128) << 64)
@@ -55,8 +55,8 @@ impl<F: Field + PrimeField, const R: usize, const L: usize> Domain<F, R> for Con
 
     fn padding(input_len: usize) -> Self::Padding {
         assert_eq!(input_len, L);
-        let k = (L + R - 1) / R;
-        iter::repeat(F::ZERO).take(k * R - L)
+        let k = L.div_ceil(R);
+        iter::repeat_n(F::ZERO, k * R - L)
     }
 }
 

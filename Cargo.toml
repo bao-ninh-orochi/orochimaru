@@ -42,3 +42,18 @@ serde = "1.0.210"
 nova-snark = { git = "https://github.com/microsoft/Nova", default-features = false }
 bellpepper-core = { version = "0.4.0", default-features = false }
 arecibo = { git = "https://github.com/argumentcomputer/arecibo" }
+# Zinc+ transparent SNARK (NethermindEth). Research-grade, unaudited and not
+# published on crates.io, so every crate is pinned to one reviewed revision.
+zinc-protocol = { git = "https://github.com/NethermindEth/zinc-plus.git", rev = "13f540d9345d467833ac6cc095af966987c65c4a" }
+zinc-uair = { git = "https://github.com/NethermindEth/zinc-plus.git", rev = "13f540d9345d467833ac6cc095af966987c65c4a" }
+zinc-poly = { git = "https://github.com/NethermindEth/zinc-plus.git", rev = "13f540d9345d467833ac6cc095af966987c65c4a" }
+zinc-primality = { git = "https://github.com/NethermindEth/zinc-plus.git", rev = "13f540d9345d467833ac6cc095af966987c65c4a" }
+zinc-utils = { git = "https://github.com/NethermindEth/zinc-plus.git", rev = "13f540d9345d467833ac6cc095af966987c65c4a" }
+zip-plus = { git = "https://github.com/NethermindEth/zinc-plus.git", rev = "13f540d9345d467833ac6cc095af966987c65c4a" }
+# Exact versions used by the pinned zinc-plus revision; kept in lockstep with it.
+crypto-bigint = "=0.7.0-rc.9"
+crypto-primitives = { git = "https://github.com/NethermindEth/crypto-primitives.git", rev = "aa65fab", features = [
+    "std",
+    "crypto_bigint",
+    "rand",
+] }

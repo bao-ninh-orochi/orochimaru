@@ -12,6 +12,12 @@
 )]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "zinc")]
+extern crate std;
+
+/// Proof-system backend abstraction for the memory-consistency statement.
+/// Currently selectable: Halo2 (PLONK) and, behind the `zinc` feature, Zinc+.
+pub mod backend;
 /// Base trait for generic type
 pub mod base;
 /// A commitment module that commit to the memory trace through the execution trace
@@ -29,6 +35,10 @@ pub mod machine;
 pub mod nova;
 /// Memory consistency circuit using Supernova proof system
 pub mod supernova;
+/// Memory consistency argument using the Zinc+ proof system (SNARK without
+/// zero-knowledge; see `src/zincplus/README.md`). Requires the `zinc` feature.
+#[cfg(feature = "zinc")]
+pub mod zincplus;
 #[cfg(test)]
 mod tests {
     extern crate alloc;

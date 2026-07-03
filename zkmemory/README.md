@@ -82,6 +82,27 @@ These instructions need to be satisfied following conditions:
 - **`WRITE` instruction**
 - Every `WRITE` access must write on writable memory chunks _(some areas of the memory might be read only)_.
 
+## Proof-system backends
+
+The memory-consistency statement can be proven with several proof systems;
+the seam is the `MemoryConsistencyBackend` trait in [`src/backend.rs`](src/backend.rs):
+
+- **Halo2 (PLONK)** — the reference constraint system in
+  [`src/constraints`](src/constraints): a permutation argument linking the
+  time-ordered and the address-sorted trace, plus ordering and consistency
+  circuits. Currently checked with `MockProver`.
+- **Zinc+** *(optional, feature `zinc`)* — a transparent, plausibly
+  post-quantum SNARK by NethermindEth producing succinct transferable
+  proofs. **Not zero-knowledge yet**; read
+  [`src/zincplus/README.md`](src/zincplus/README.md) before use.
+
+  ```text
+  cargo test -p zkmemory --features zinc
+  cargo run -p zkmemory --example zincplus-memory-consistency --features zinc --release
+  ```
+- **Nova / Supernova** — folding-scheme provers over a fixed-size memory
+  (see [`src/nova`](src/nova), [`src/supernova`](src/supernova)).
+
 ## Features
 
 ### Configurable Word Size
