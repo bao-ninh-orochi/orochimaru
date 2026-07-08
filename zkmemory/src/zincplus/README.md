@@ -12,6 +12,7 @@ zkmemory/src/zincplus/
 ├── mod.rs        module root, public re-exports
 ├── types.rs      concrete Zinc+ protocol type parameters (field, codes, widths)
 ├── uair.rs       the memory-consistency UAIR + witness builder
+├── benes.rs      Beneš-network routing for the permutation argument
 ├── prover.rs     prove / verify entry points, proof (de)serialization, errors
 ├── testcases.rs  positive and negative (soundness) tests
 └── README.md     this file
@@ -41,6 +42,12 @@ let zinc = ZincPlusBackend;
 zinc.verify(&zinc.prove(&trace)?)?;
 ```
 
+The input trace must satisfy the same contract the Halo2
+`OriginalMemoryCircuit` places on the original trace: records in execution
+order, `time_log[0] = 0`, strictly increasing `time_log`s (gaps allowed).
+Traces produced by [`machine.trace()`](../machine.rs) satisfy this by
+construction.
+
 Build with `cargo build -p zkmemory --features zinc`. The feature requires a
 `std` environment and Rust ≥ 1.85 (Zinc+ is an edition-2024 workspace); the
 repository toolchain is pinned accordingly in [`rust-toolchain`](../../../rust-toolchain).
@@ -62,80 +69,92 @@ Fiat-Shamir transcript.
 
 ## The statement proven
 
-The prover commits to a memory trace of `2^num_vars − 1` rows (the machine's
-records sorted by `(address, time_log)`, followed by benign padding rows) and
-proves, for every pair of adjacent rows:
+The proof attests knowledge of a witness containing *two orderings of the
+same trace* — the time-ordered original trace `O` and its
+`(address, time_log)`-sorted permutation `S`, each padded to `2^num_vars`
+rows — satisfying all three sub-statements of the composed Halo2
+`MemoryConsistencyCircuit`:
 
-| # | constraint | meaning |
-|---|-----------|---------|
-| 1 | `is_first · (instr − 1) = 0` | the first access of the trace is a write |
-| 2 | `instr' · (instr' − 1) = 0` | instructions are boolean (0 = read, 1 = write) |
-| 3 | `s_j · (s_j − 1) = 0` | first-difference selectors are boolean |
-| 4 | `Σ_j s_j = 1` | exactly one first-difference position |
-| 5 | `(1 − Σ_{l≤j} s_l) · (L'_j − L_j) = 0` | limbs before the first difference are equal |
-| 6 | `Σ_j s_j·(L'_j − L_j) − 1 − r ∈ (X − 2)` | the first differing limb strictly increases |
-| 7 | `w = (s_8 + s_9) · (instr' − 1)` | helper: `w = −1` iff *read at unchanged address* |
-| 8 | `w · (value'_j − value_j) = 0` | a read returns the previous value at that address |
-| 9 | `(1 − s_8 − s_9) · (instr' − 1) = 0` | the first access to a new address is a write |
+| sub-statement | Halo2 circuit | Zinc+ constraints |
+|---------------|---------------|-------------------|
+| original-trace consistency: `time_log[0] = 0`, `time_log[i] < time_log[i+1]` | `OriginalMemoryCircuit` | `is_first` pins row 0's time limbs; a one-hot limb selector + slack limb enforce the strict `u64` increase |
+| sorted-trace consistency: `(address, time_log)` strictly increases, first access (overall and per address) is a write, instructions boolean, reads return the previous value at the address | `SortedMemoryCircuit` | the lookup-free lexicographic comparison and read-check constraints described in [`uair.rs`](uair.rs) |
+| `S` is a permutation of `O` | `PermutationCircuit` (PLONK shuffle) | a **Beneš switching network**: `2v - 1` layers of boolean-selected conditional swaps between rows `i` and `i + 2^k`, carrying the full record payload from `S` (network input) to `O` (network output) |
 
-where `L_0..L_9` is the lexicographic limb vector `address ‖ time_log`
-(32-bit limbs, most significant first) and primes denote the next row.
-Constraints 3–6 together are a lookup-free strict lexicographic comparison:
-`s` selects the first differing limb, everything before it must be equal, and
-the selected limb must grow by `1 + r` where `r` is a committed 32-bit value.
-These are semantically the same constraints as the Halo2
-`SortedMemoryCircuit` (`src/constraints/sorted_memory_circuit.rs`).
+Both traces are witnesses; like the composed Halo2 circuit, the statement
+has no trace-dependent public inputs (the verifier reconstructs the fixed
+`is_first` and bit-indicator selector columns itself).
 
-Addresses, values and `time_log`s live in *binary polynomial* columns:
-`BinaryPoly<32>` cells whose 32 coefficients are proven boolean by Zinc+'s
-built-in booleanity argument, so every limb is range-checked to `u32` for
-free — no lookup tables are needed anywhere.
+Randomized permutation arguments (PLONK shuffle, LogUp) are not expressible
+in Zinc+ — there is no lookup layer yet, no verifier-randomness columns, and
+committed cells are small integers fixed before the random prime is sampled,
+so a grand-product accumulator over the proof field cannot even be
+materialized. The Beneš network sidesteps randomness entirely: switch
+equations are cell-exact, so each network state is *exactly* a permutation
+of the previous one, and `multiset(O) = multiset(S)` holds with no soundness
+error beyond the (negligible) probability that a small nonzero integer
+vanishes mod the ~192-bit Fiat-Shamir-sampled prime. Routing bits are free
+witnesses: a malicious router can only fail to prove, never prove a false
+statement. This is the established deterministic RAM-checking technique of
+challenge-less proof systems (Pantry, Buffet, xJsnark).
+
+Addresses, values, `time_log`s and `stack_depth`s live in *binary
+polynomial* columns: `BinaryPoly<32>` cells whose 32 coefficients are proven
+boolean by Zinc+'s built-in booleanity argument, so every limb is
+range-checked to `u32` for free — no lookup tables are needed anywhere.
 
 Zinc+ exempts the very last row from constraints (its built-in last-row
 selector); the witness builder therefore always keeps at least one padding
 row, so **no real record ever occupies the exempt row**. Padding rows replay
-the last record as reads with increasing `time_log`s, which satisfies every
-constraint.
-
-The only public input is the `is_first` column (`[1, 0, 0, …]`), which the
-verifier reconstructs itself; it is absorbed into the Fiat-Shamir transcript
-by the protocol before any challenge is drawn.
+the last *sorted* record as reads with `time_log`s continuing past the
+global maximum, which satisfies both orderings' constraints and keeps the
+two padded multisets equal. The exemption opens no hole in the network
+either: row `2^v - 1` has every index bit set, so it is never the anchor
+(upper) row of any switch, and all constraints binding it are anchored at
+non-exempt rows.
 
 ## Security status — differences from the Halo2 backend
 
-Users must understand three deliberate limitations of this v1 integration:
+Users must understand two deliberate limitations of this integration:
 
 1. **No zero-knowledge.** Zinc+ currently provides succinctness and
    transparency but no hiding: witness columns are committed and opened
    without masking. Treat the proof as potentially revealing the entire
    trace. Use the Halo2 backend when privacy is required.
 
-2. **No in-SNARK permutation link.** The Halo2 circuit additionally proves
-   that the sorted trace is a *permutation* of a time-ordered original trace
-   (via PLONK's shuffle argument) and that the original trace's `time_log`s
-   start at zero and strictly increase. Zinc+ has no permutation or lookup
-   argument yet (upstream's lookup layer is scaffolded but explicitly
-   unimplemented), so those two sub-statements are **not** enforced here.
-   Note that the composed Halo2 circuit has *zero public inputs* — both
-   traces are witnesses — so its externally visible statement is "the prover
-   knows a consistent trace", which the Zinc+ backend also delivers. The gap
-   matters once the memory argument must be *linked to an execution proof*
-   (a zkVM composing CPU and memory arguments): that linkage needs the
-   permutation argument and awaits upstream support.
-
-3. **Research-grade upstream.** Zinc+ is unaudited and marked by its authors
+2. **Research-grade upstream.** Zinc+ is unaudited and marked by its authors
    as for research/educational use. The dependency is pinned to one reviewed
    revision (see `[workspace.dependencies]`), and the security parameters in
    [`types.rs`](types.rs) (repetition factor 8, 100 column openings, 192-bit
    sampled prime) are the upstream research defaults, not audited production
    parameters.
 
-Within those boundaries the encoding itself is designed to be sound; the
-constraint-by-constraint argument is documented in [`uair.rs`](uair.rs)
-(module docs, "Constraint soundness sketch") and exercised by negative tests
-in [`testcases.rs`](testcases.rs) (stale reads, reads of unwritten
-addresses, first-access reads, tampered/truncated proofs, duplicated
-`time_log`s).
+The earlier v1 limitation — no in-SNARK permutation link between the sorted
+and original traces — is **resolved**: the Beneš network enforces the full
+composed Halo2 statement. The constraint-by-constraint soundness argument is
+documented in [`uair.rs`](uair.rs) (module docs) and exercised by negative
+tests in [`testcases.rs`](testcases.rs), including direct witness-tampering
+attacks on the network states, switch bits, both trace orderings and the
+transition slacks.
+
+## Performance notes
+
+The deterministic permutation argument is paid for in trace width: the
+network adds `2v` states of 21 binary columns each (plus one switch column
+per layer), so the committed trace has `~42v + 2` binary columns instead of
+the ~20 of the consistency-only v1 backend. Measured on commodity hardware
+(release mode, single-threaded): 200 records (`v = 8`) prove in ~1.3 s and
+verify in ~0.12 s with a ~9 MiB proof; 900 records (`v = 10`) prove in
+~6.4 s and verify in ~0.2 s with a ~11.5 MiB proof. Linear-code commitments
+have large constants, so proofs are far bigger than pairing-based SNARK
+proofs. The verifier additionally pays `O(2^{v-1})` field operations per
+large-stride shifted column when evaluating Zinc+'s shift predicates, which
+is why [`MAX_NUM_VARS`](uair.rs) is 16 (`≤ 65 535` records): beyond that,
+verification time becomes impractical and the permutation argument should
+instead migrate to upstream's lookup layer once it lands (see below).
+
+The upstream `parallel` (rayon) and `simd` features can be forwarded later
+if throughput becomes a concern.
 
 ## Migration plan (tracking upstream Zinc+ maturity)
 
@@ -146,12 +165,10 @@ progress can be adopted incrementally:
 - **When Zinc+ gains zero-knowledge** (witness masking): bump the pinned
   revision, enable the hiding mode in `types.rs`/`prover.rs`; the UAIR and
   the public API stay unchanged.
-- **When Zinc+ lands its lookup/LogUp layer**: add the permutation link —
-  commit the time-ordered trace next to the sorted one and prove multiset
-  equality plus the original-trace time ordering (`time[0] = 0`,
-  `time[i+1] > time[i]`), reaching full parity with the Halo2 statement.
-  The column layout in `uair.rs` was chosen so the original-trace columns
-  can be appended without disturbing the existing indices.
+- **When Zinc+ lands its lookup/LogUp layer**: replace the Beneš network
+  with a randomized multiset argument to reclaim the `~40v` extra committed
+  columns and lift `MAX_NUM_VARS`; the statement and public API stay
+  unchanged.
 - **When upstream publishes audited parameters**: update `types.rs`
   accordingly (`REP_FACTOR`, `NUM_COLUMN_OPENINGS`, field size).
 - **Halo2 parity work in the other direction**: the Halo2 backend currently
@@ -159,15 +176,3 @@ progress can be adopted incrementally:
   prover just for the permutation sub-circuit); giving it a real
   transferable proof artifact would make the two backends fully
   interchangeable behind the trait.
-
-## Performance notes
-
-Proving is dominated by the Zip+ commitments over `2^num_vars` rows and
-32 committed columns. The trace is padded to the next power of two (minimum
-8 rows, maximum `2^24`); proving a few hundred records takes on the order of
-seconds in release mode on commodity hardware, and verification is
-milliseconds. Proof size is where the trade-off shows: linear-code
-commitments have large constants (the 8-record example proof is ≈560 KiB —
-"succinct" asymptotically, far bigger than a pairing-based SNARK proof).
-The upstream `parallel` (rayon) and `simd` features can be forwarded later
-if throughput becomes a concern.
