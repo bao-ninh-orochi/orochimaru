@@ -16,9 +16,13 @@
 //! ```
 //!
 //! Every backend consumes the *time-ordered* execution trace exactly as
-//! returned by [`crate::machine::AbstractMachine::trace`] and internally
-//! derives whatever sorted/converted representation it needs. The backends
-//! differ in the artifacts they produce and in their trust profile:
+//! returned by [`crate::machine::AbstractMachine::trace`] (`time_log`s
+//! starting at zero and strictly increasing) and internally derives
+//! whatever sorted/converted representation it needs. Both backends prove
+//! the same composed statement — original-trace time consistency,
+//! sorted-trace memory consistency and the permutation link between the two
+//! orderings — but differ in the artifacts they produce and in their trust
+//! profile:
 //!
 //! | backend | proof artifact | trusted setup | zero-knowledge | status |
 //! |---------|----------------|---------------|----------------|--------|
@@ -144,9 +148,11 @@ impl MemoryConsistencyBackend for Halo2Backend {
     }
 }
 
-/// The Zinc+ backend: produces a succinct, transparent SNARK for the
-/// sorted-trace consistency statement. **Not zero-knowledge** — see
-/// [`crate::zincplus`] for the security discussion.
+/// The Zinc+ backend: produces a succinct, transparent SNARK for the full
+/// composed memory-consistency statement (original-trace time consistency,
+/// sorted-trace consistency, and their permutation link via a deterministic
+/// Beneš network). **Not zero-knowledge** — see [`crate::zincplus`] for the
+/// security discussion.
 #[cfg(feature = "zinc")]
 #[derive(Clone, Debug, Default)]
 pub struct ZincPlusBackend;

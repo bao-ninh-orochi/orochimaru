@@ -1,15 +1,23 @@
 //! Prover / verifier entry points of the Zinc+ memory-consistency backend.
 //!
-//! [`prove_memory_consistency`] takes the execution trace produced by an
-//! abstract machine ([`crate::machine::AbstractMachine::trace`]), sorts it by
-//! `(address, time_log)`, builds the UAIR witness and runs the Zinc+ prover.
-//! [`verify_memory_consistency`] re-derives the (transparent) commitment
-//! parameters and the public columns, then runs the Zinc+ verifier.
+//! [`prove_memory_consistency`] takes the *time-ordered* execution trace
+//! produced by an abstract machine ([`crate::machine::AbstractMachine::trace`]),
+//! validates the original-trace input contract (`time_log`s start at zero
+//! and strictly increase), sorts it by `(address, time_log)`, builds the
+//! UAIR witness — including the Beneš permutation network linking the two
+//! orderings — and runs the Zinc+ prover. [`verify_memory_consistency`]
+//! re-derives the (transparent) commitment parameters and the public
+//! columns, then runs the Zinc+ verifier.
 //!
 //! Zinc+ has no trusted setup and the prover is deterministic: all
 //! challenges, including the random prime-field modulus, are derived from
 //! the Blake3 Fiat-Shamir transcript after the witness commitments and the
 //! public columns are absorbed.
+//!
+//! The UAIR type is const-generic over the trace-size exponent (a
+//! [`zinc_uair::UairSignature`] is static per type while the permutation
+//! network's shape depends on the trace size), so proving and verification
+//! dispatch over the supported `num_vars` range via [`with_const_num_vars`].
 
 extern crate alloc;
 use alloc::{
@@ -20,7 +28,11 @@ use alloc::{
 use core::fmt;
 
 use zinc_protocol::{Proof, ZincPlusPiop};
-use zinc_uair::{ideal::DegreeOneIdeal, ideal_collector::IdealOrZero, Uair, UairTrace};
+use zinc_uair::{
+    ideal::{DegreeOneIdeal, ImpossibleIdeal},
+    ideal_collector::IdealOrZero,
+    UairTrace,
+};
 use zinc_utils::CHECKED;
 use zip_plus::pcs_transcript::PcsProverTranscript;
 
@@ -28,30 +40,77 @@ use crate::{base::B256, machine::TraceRecord};
 
 use super::{
     types::{setup_params, MemoryZincTypes, ZInt, D, F, QUARTER_D},
-    uair::{build_uair_trace, is_first_column, MemoryConsistencyUair, MAX_NUM_VARS, MIN_NUM_VARS},
+    uair::{
+        build_uair_trace, public_int_columns, MemoryConsistencyUair, MAX_NUM_VARS, MIN_NUM_VARS,
+    },
 };
 
-/// The fully-instantiated Zinc+ PIOP driving this backend.
-type MemoryPiop = ZincPlusPiop<MemoryZincTypes, MemoryConsistencyUair, F, D, QUARTER_D>;
+/// The fully-instantiated Zinc+ PIOP driving this backend, for traces of
+/// `2^V` padded rows.
+type MemoryPiop<const V: usize> =
+    ZincPlusPiop<MemoryZincTypes, MemoryConsistencyUair<V>, F, D, QUARTER_D>;
+
+/// Dispatch a macro over every supported `num_vars` as a const generic.
+///
+/// The body macro is invoked with a `usize` literal, so `$body!(N)` can name
+/// `MemoryPiop::<N>`. Keep the arms in sync with [`MIN_NUM_VARS`] and
+/// [`MAX_NUM_VARS`].
+macro_rules! with_const_num_vars {
+    ($num_vars:expr, $body:ident) => {
+        match $num_vars {
+            3 => $body!(3),
+            4 => $body!(4),
+            5 => $body!(5),
+            6 => $body!(6),
+            7 => $body!(7),
+            8 => $body!(8),
+            9 => $body!(9),
+            10 => $body!(10),
+            11 => $body!(11),
+            12 => $body!(12),
+            13 => $body!(13),
+            14 => $body!(14),
+            15 => $body!(15),
+            16 => $body!(16),
+            other => unreachable!(
+                "num_vars {other} was validated to lie in [{MIN_NUM_VARS}, {MAX_NUM_VARS}]"
+            ),
+        }
+    };
+}
 
 /// Errors of the Zinc+ memory-consistency backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZincMemoryError {
     /// The execution trace is empty; there is nothing to prove.
     EmptyTrace,
-    /// The execution trace does not fit in `2^MAX_NUM_VARS - 1` rows.
-    TraceTooLong,
-    /// Two trace records share the same `(address, time_log)` pair. Traces
+    /// The first record's `time_log` is not zero. Like the Halo2
+    /// `OriginalMemoryCircuit`, the original trace must start at time zero.
+    FirstTimeNonZero {
+        /// The offending first `time_log`.
+        time_log: u64,
+    },
+    /// Two consecutive trace records share the same `time_log`. Traces
     /// produced by the abstract machine have globally unique `time_log`s.
     DuplicatedAccess {
         /// The duplicated `time_log`.
         time_log: u64,
     },
+    /// A record's `time_log` is smaller than its predecessor's. Like the
+    /// Halo2 `OriginalMemoryCircuit`, the original trace must be given in
+    /// execution order with strictly increasing `time_log`s.
+    TimeNotIncreasing {
+        /// The offending (decreased) `time_log`.
+        time_log: u64,
+    },
+    /// The execution trace does not fit in `2^MAX_NUM_VARS - 1` rows.
+    TraceTooLong,
     /// Padding the trace to a power of two would overflow the `u64` time
     /// domain.
     TimeLogOverflow,
-    /// Internal invariant violation: the sorted trace was not strictly
-    /// increasing. This indicates a bug rather than a bad input.
+    /// Internal invariant violation in the witness builder (the sorted
+    /// trace or the routed permutation network disagreed with the input).
+    /// This indicates a bug rather than a bad input.
     UnsortedTrace,
     /// The serialized proof is malformed.
     MalformedProof(String),
@@ -66,20 +125,28 @@ impl fmt::Display for ZincMemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyTrace => write!(f, "the execution trace is empty"),
+            Self::FirstTimeNonZero { time_log } => write!(
+                f,
+                "the original trace must start at time_log 0, got {time_log}"
+            ),
+            Self::DuplicatedAccess { time_log } => {
+                write!(f, "two trace records share time_log {time_log}")
+            }
+            Self::TimeNotIncreasing { time_log } => write!(
+                f,
+                "the original trace's time_logs must strictly increase; \
+                 time_log {time_log} decreases"
+            ),
             Self::TraceTooLong => {
                 write!(
                     f,
                     "the execution trace exceeds 2^{MAX_NUM_VARS} - 1 records"
                 )
             }
-            Self::DuplicatedAccess { time_log } => write!(
-                f,
-                "two trace records share the same (address, time_log = {time_log})"
-            ),
             Self::TimeLogOverflow => {
                 write!(f, "padding the trace would overflow the u64 time domain")
             }
-            Self::UnsortedTrace => write!(f, "internal error: sorted trace is not increasing"),
+            Self::UnsortedTrace => write!(f, "internal error: witness builder invariant violated"),
             Self::MalformedProof(msg) => write!(f, "malformed proof: {msg}"),
             Self::Prover(msg) => write!(f, "Zinc+ prover error: {msg}"),
             Self::Verifier(msg) => write!(f, "Zinc+ verification failed: {msg}"),
@@ -89,11 +156,13 @@ impl fmt::Display for ZincMemoryError {
 
 /// A Zinc+ memory-consistency proof.
 ///
-/// The proof attests that the prover knows a trace of `2^num_vars - 1` rows
-/// (the actual records followed by benign padding rows) that is sorted by
-/// `(address, time_log)` and memory-consistent — see
-/// [`super::uair::MemoryConsistencyUair`] for the exact relation and
-/// `src/zincplus/README.md` for what this does and does not imply.
+/// The proof attests that the prover knows a time-ordered execution trace
+/// of `2^num_vars - 1` rows (the actual records followed by benign padding
+/// rows) whose `time_log`s start at zero and strictly increase, together
+/// with its `(address, time_log)`-sorted permutation, and that the sorted
+/// ordering is memory-consistent — the same statement as the composed Halo2
+/// `MemoryConsistencyCircuit`. See [`super::uair::MemoryConsistencyUair`]
+/// for the exact relation.
 ///
 /// The proof is *succinct* and *transparent* but — with the current
 /// upstream Zinc+ — **not zero-knowledge**: assume the trace can be
@@ -161,36 +230,55 @@ impl ZincMemoryProof {
 /// system.
 ///
 /// The input is the *time-ordered* trace exactly as returned by
-/// [`crate::machine::AbstractMachine::trace`]; sorting by
-/// `(address, time_log)`, limb decomposition and padding happen internally.
-/// An *inconsistent* trace (e.g. a read returning a stale value) makes the
-/// witness violate the UAIR constraints and surfaces as
-/// [`ZincMemoryError::Prover`].
+/// [`crate::machine::AbstractMachine::trace`] and must satisfy the
+/// original-trace contract of the Halo2 `OriginalMemoryCircuit`:
+/// `time_log[0] = 0` and strictly increasing `time_log`s (gaps are
+/// allowed). Sorting by `(address, time_log)`, limb decomposition, padding
+/// and the permutation-network routing happen internally. An *inconsistent*
+/// trace (e.g. a read returning a stale value) makes the witness violate
+/// the UAIR constraints and surfaces as [`ZincMemoryError::Prover`].
 ///
 /// # Errors
 ///
-/// See [`ZincMemoryError`]; structurally invalid traces (empty, duplicated
-/// `(address, time_log)`, too long) are rejected before proving starts.
+/// See [`ZincMemoryError`]; structurally invalid traces (empty, wrong time
+/// ordering, too long) are rejected before proving starts.
 pub fn prove_memory_consistency(
     trace: &[TraceRecord<B256, B256, 32, 32>],
 ) -> Result<ZincMemoryProof, ZincMemoryError> {
     let (uair_trace, num_vars) = build_uair_trace(trace)?;
+    prove_from_uair_trace(&uair_trace, num_vars)
+}
+
+/// Run the Zinc+ prover on an already-built UAIR witness.
+///
+/// Split out of [`prove_memory_consistency`] so soundness tests can tamper
+/// with individual witness columns before proving.
+pub(crate) fn prove_from_uair_trace(
+    uair_trace: &UairTrace<'static, ZInt, ZInt, D, D>,
+    num_vars: usize,
+) -> Result<ZincMemoryProof, ZincMemoryError> {
     let params = setup_params(num_vars);
-    let proof = MemoryPiop::prove::<false, CHECKED>(
-        &params,
-        &uair_trace,
-        num_vars,
-        zinc_protocol::project_scalar_fn,
-    )
-    .map_err(|e| ZincMemoryError::Prover(e.to_string()))?;
+    macro_rules! run_prove {
+        ($v:literal) => {
+            MemoryPiop::<$v>::prove::<false, CHECKED>(
+                &params,
+                uair_trace,
+                num_vars,
+                zinc_protocol::project_scalar_fn,
+            )
+        };
+    }
+    let proof = with_const_num_vars!(num_vars, run_prove)
+        .map_err(|e| ZincMemoryError::Prover(e.to_string()))?;
     Ok(ZincMemoryProof { proof, num_vars })
 }
 
 /// Verify a Zinc+ memory-consistency proof.
 ///
 /// The verifier re-derives the transparent commitment parameters and the
-/// public `is_first` column (`[1, 0, 0, ...]`) itself, so a proof is
-/// accepted only for the exact public inputs this backend defines.
+/// public columns (`is_first` and the network's `upper_k` bit indicators)
+/// itself, so a proof is accepted only for the exact public inputs this
+/// backend defines.
 ///
 /// # Errors
 ///
@@ -206,23 +294,27 @@ pub fn verify_memory_consistency(proof: &ZincMemoryProof) -> Result<(), ZincMemo
     let public_trace: UairTrace<'static, ZInt, ZInt, D, D> = UairTrace {
         binary_poly: Vec::new().into(),
         arbitrary_poly: Vec::new().into(),
-        int: alloc::vec![is_first_column(1usize << num_vars)].into(),
+        int: public_int_columns(num_vars).into(),
     };
-    MemoryPiop::verify::<_, CHECKED>(
-        &params,
-        proof.proof.clone(),
-        &public_trace,
-        num_vars,
-        zinc_protocol::project_scalar_fn,
-        project_ideal,
-        project_fq_ideal,
-    )
-    .map_err(|e| ZincMemoryError::Verifier(e.to_string()))
+    macro_rules! run_verify {
+        ($v:literal) => {
+            MemoryPiop::<$v>::verify::<_, CHECKED>(
+                &params,
+                proof.proof.clone(),
+                &public_trace,
+                num_vars,
+                zinc_protocol::project_scalar_fn,
+                project_ideal,
+                project_fq_ideal,
+            )
+        };
+    }
+    with_const_num_vars!(num_vars, run_verify).map_err(|e| ZincMemoryError::Verifier(e.to_string()))
 }
 
 /// Project the UAIR's `Z[X]` ideals into the sampled prime field.
 fn project_ideal(
-    ideal: &IdealOrZero<<MemoryConsistencyUair as Uair>::Ideal>,
+    ideal: &IdealOrZero<DegreeOneIdeal<ZInt>>,
     field_cfg: &<F as crypto_primitives::HasPrimeFieldConfig>::Config,
 ) -> IdealOrZero<DegreeOneIdeal<F>> {
     ideal.map(|i| DegreeOneIdeal::from_with_cfg(i, field_cfg))
@@ -231,7 +323,7 @@ fn project_ideal(
 /// The memory-consistency UAIR declares no `F_q[X]` prime families, so this
 /// projection can never be invoked at runtime.
 fn project_fq_ideal(
-    _ideal: &IdealOrZero<<MemoryConsistencyUair as Uair>::FqIdeal>,
+    _ideal: &IdealOrZero<ImpossibleIdeal>,
     _field_cfg: &<F as crypto_primitives::HasPrimeFieldConfig>::Config,
 ) -> IdealOrZero<DegreeOneIdeal<F>> {
     unreachable!("the memory-consistency UAIR has no F_q[X] constraints")
