@@ -482,3 +482,122 @@ fn test_error_display_is_informative() {
     let message = format!("{}", ZincMemoryError::FirstTimeNonZero { time_log: 42 });
     assert!(message.contains("42"), "unhelpful message: {message}");
 }
+
+// ---------------------------------------------------------------------------
+// Review probes: adversarial cases from the 2026-07 deep review of the
+// Zinc+ integration, covering constraint liveness (S6, S7, the selector
+// one-hotness), the upper_k mask semantics, proof-header integrity and the
+// padding boundary.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn probe_tamper_w_helper_rejected() {
+    // Zero out the w helper at a row where the sorted trace has a read at an
+    // unchanged address (w = -1): S7 (w = a_same * (instr' - 1)) must fail,
+    // otherwise S8's value check would be silently disabled.
+    assert_tampered_witness_rejected(|uair_trace, layout| {
+        // Column order: ..., s_0..s_9, w, o_hi, o_lo, switches.
+        let w_col = layout.int_switch - 3;
+        let ints = uair_trace.int.to_mut();
+        let row = (0..ints[w_col].evaluations.len())
+            .find(|&i| ints[w_col].evaluations[i] == -1)
+            .expect("the consistent trace has a read at an unchanged address");
+        ints[w_col].evaluations[row] = 0;
+    });
+}
+
+#[test]
+fn probe_tamper_sorted_slack_rejected() {
+    // Corrupt the sorted-trace lexicographic slack r_S: S6 must fail.
+    assert_tampered_witness_rejected(|uair_trace, layout| {
+        set_bp_cell(uair_trace, layout.bp_slack_sorted, 0, 1234);
+    });
+}
+
+#[test]
+fn probe_move_selector_position_rejected() {
+    // Move the one-hot first-difference selector to a wrong position while
+    // keeping the sum = 1: S5/S6 must fail.
+    assert_tampered_witness_rejected(|uair_trace, layout| {
+        let num_lex = crate::zincplus::uair::NUM_LEX_LIMBS;
+        // Column order: ..., s_0..s_9, w, o_hi, o_lo, switches.
+        let s0 = layout.int_switch - 3 - num_lex;
+        let ints = uair_trace.int.to_mut();
+        let row = 0;
+        let k = (0..num_lex)
+            .find(|&j| ints[s0 + j].evaluations[row] == 1)
+            .expect("row 0 has a selected limb");
+        let k_wrong = (k + 1) % num_lex;
+        ints[s0 + k].evaluations[row] = 0;
+        ints[s0 + k_wrong].evaluations[row] = 1;
+    });
+}
+
+#[test]
+fn probe_dead_switch_cell_is_unconstrained() {
+    // A switch bit at a *lower* (non-anchor) row is a dead witness cell: the
+    // public upper_k mask multiplies it out of every constraint. Tampering it
+    // must NOT affect the proof — this documents the mask semantics (and that
+    // soundness never reads lower-row switch bits).
+    let trace = consistent_trace();
+    let (mut uair_trace, num_vars) =
+        build_uair_trace(&trace[..7]).expect("the honest witness builds");
+    let layout = NetLayout::new(num_vars);
+    // Layer 0 has stride 2^(num_vars-1); rows with that bit set are lower.
+    let lower_row = 1usize << (num_vars - 1);
+    uair_trace.int.to_mut()[layout.int_switch].evaluations[lower_row] = 1;
+    let proof = prove_from_uair_trace(&uair_trace, num_vars)
+        .expect("dead-cell tampering must not break proving");
+    verify_memory_consistency(&proof).expect("dead-cell tampering must not break verification");
+}
+
+#[test]
+fn probe_num_vars_header_rewrite_rejected() {
+    // Rewriting the num_vars header of a serialized proof must fail cleanly
+    // (params/signature mismatch), never verify and never panic.
+    let proof = prove_memory_consistency(&consistent_trace()[..7]).expect("proving succeeds");
+    let mut bytes = proof.to_bytes().expect("serialization succeeds");
+    assert_eq!(bytes[0], 3, "expected num_vars = 3 in the header");
+    bytes[0] = 4;
+    match crate::zincplus::ZincMemoryProof::from_bytes(&bytes) {
+        Err(_) => {}
+        Ok(p) => assert!(
+            verify_memory_consistency(&p).is_err(),
+            "a proof with a rewritten num_vars header verified"
+        ),
+    }
+}
+
+#[test]
+fn probe_trailing_bytes_behavior() {
+    // Document how from_bytes treats trailing garbage after a valid proof:
+    // strict rejection is preferred; acceptance is only a cosmetic
+    // malleability of the byte encoding (the parsed proof is unchanged).
+    let proof = prove_memory_consistency(&consistent_trace()[..7]).expect("proving succeeds");
+    let mut bytes = proof.to_bytes().expect("serialization succeeds");
+    bytes.extend_from_slice(&[0xAB; 8]);
+    match crate::zincplus::ZincMemoryProof::from_bytes(&bytes) {
+        Err(_) => {}
+        Ok(p) => {
+            assert_eq!(p, proof, "trailing bytes must not change the parsed proof");
+            std::eprintln!("note: from_bytes tolerates trailing bytes");
+        }
+    }
+}
+
+#[test]
+fn probe_early_max_address_padding_boundary_accepted() {
+    // The max address is touched only at the very beginning, so the padding
+    // rows replay a record whose time_log (1) is far below the padding times
+    // (> 5). Exercises the sorted-tail padding boundary: (A_max, 1) is
+    // followed by (A_max, 6), (A_max, 7), ... in the sorted ordering.
+    let trace = alloc::vec![
+        record(0, MemoryInstruction::Write, 0xff00, 77),
+        record(1, MemoryInstruction::Read, 0xff00, 77),
+        record(2, MemoryInstruction::Write, 0x00, 1),
+        record(3, MemoryInstruction::Write, 0x20, 2),
+        record(4, MemoryInstruction::Read, 0x00, 1),
+        record(5, MemoryInstruction::Read, 0x20, 2),
+    ];
+    assert_accepted(&trace);
+}
